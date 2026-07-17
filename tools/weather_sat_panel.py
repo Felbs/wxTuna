@@ -27,8 +27,37 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import weather_sat as ws   # predictor + paths, shared
+import sonde                # balloon schedule + SondeHub radar
 
 PORT = 8644
+
+_sonde = {"t": 0.0, "radar": [], "err": None, "busy": False}
+
+
+def _radar_refresh():
+    try:
+        _sonde["radar"] = sonde.fetch_radar(350)
+        _sonde["err"] = None
+    except Exception as e:
+        _sonde["err"] = str(e)
+    _sonde["t"] = time.time()
+    _sonde["busy"] = False
+
+
+def balloon_state():
+    """Launch countdown (exact - fixed NWS schedule) + cached live radar."""
+    import threading
+    if time.time() - _sonde["t"] > 90 and not _sonde["busy"]:
+        _sonde["busy"] = True
+        threading.Thread(target=_radar_refresh, daemon=True).start()
+    nxt = sonde.next_launches(3)
+    return {
+        "next_launches": [{"release": L["release_utc"].strftime("%Y-%m-%dT%H:%M:%S"),
+                           "synoptic": L["synoptic"]} for L in nxt],
+        "radar": _sonde["radar"],
+        "radar_age_s": int(time.time() - _sonde["t"]) if _sonde["t"] else None,
+        "radar_err": _sonde["err"],
+    }
 
 _sched = {"t": 0.0, "data": []}
 _satcache = {"t": 0.0, "sats": None}
@@ -237,6 +266,16 @@ h2{font-size:12px;letter-spacing:.12em;color:var(--mu);margin:0 0 10px;font-weig
 </div>
 
 <div class="card">
+  <h2>WEATHER BALLOONS <span class="mut">· NWS releases 2x daily · live via SondeHub</span></h2>
+  <div class="row" style="margin-bottom:10px">
+    <div><div class="mut">NEXT RELEASE IN</div><div class="big" id="bcd">…</div></div>
+    <div><div class="mut">NEXT WINDOWS</div><div id="blist" class="mut">…</div></div>
+  </div>
+  <table><thead><tr><th>ALOFT NOW</th><th>DIST</th><th>ALT</th><th>FREQ</th></tr></thead>
+  <tbody id="bradar"></tbody></table>
+</div>
+
+<div class="card">
   <h2>CAPTURES <span class="mut">· click a card to render its spectrum</span></h2>
   <div id="caps" class="caps"></div>
 </div>
@@ -301,6 +340,21 @@ async function poll(){
     let g=p.max_elev>=25?'good':'';
     tb.innerHTML+=`<tr><td>${fmtLocal(p.peak)}</td><td>${p.sat}</td>
       <td class="${g}">${p.max_elev}&deg;${p.max_elev>=25?' ★':''}</td><td>${p.dur_min} min</td></tr>`;});
+  // balloons
+  let B=j.balloons||{};
+  window._cdb = (B.next_launches&&B.next_launches.length)
+      ? new Date(B.next_launches[0].release+'Z').getTime() : null;
+  let bl=document.getElementById('blist');
+  bl.innerHTML=(B.next_launches||[]).map(L=>
+      `${fmtLocal(L.release+'Z')} <span class="eyebrow">(${L.synoptic})</span>`).join('<br>');
+  let br=document.getElementById('bradar'); br.innerHTML='';
+  if((B.radar||[]).length){
+    B.radar.forEach(s=>{br.innerHTML+=`<tr><td>${s.serial} <span class="mut">${s.type}</span></td>
+      <td>${s.km} km</td><td>${(s.alt_m/1000).toFixed(1)} km</td>
+      <td class="good">${s.mhz?s.mhz.toFixed(3)+' MHz':'?'}</td></tr>`;});
+  } else {
+    br.innerHTML=`<tr><td colspan=4 class="mut">${B.radar_err?('radar: '+B.radar_err):'no balloons aloft in range right now'}</td></tr>`;
+  }
   // captures
   let cd=document.getElementById('caps'); cd.innerHTML='';
   (j.captures||[]).forEach(c=>{let el=document.createElement('div');el.className='cap';
@@ -310,7 +364,11 @@ async function poll(){
   if(!(j.captures||[]).length) cd.innerHTML='<div class="mut">no captures yet — they appear here as passes are recorded</div>';
 }
 function tick(){if(window._cd){let s=(window._cd-(Date.now()-skew))/1000;
-  let e=document.getElementById('cd'); if(e)e.textContent=hms(s);}}
+  let e=document.getElementById('cd'); if(e)e.textContent=hms(s);}
+  if(window._cdb!==null&&window._cdb!==undefined){
+    let s=(window._cdb-(Date.now()-skew))/1000;
+    let e=document.getElementById('bcd');
+    if(e)e.textContent=(s>0)?hms(s):'IN FLIGHT NOW';}}
 function showSpec(file){let f=file.split(/[\\/]/).pop();
   let m=document.getElementById('modal');document.getElementById('modimg').src='/api/spectrum?file='+encodeURIComponent(f);
   m.style.display='flex';}
@@ -349,6 +407,7 @@ class H(BaseHTTPRequestHandler):
                     "recording_elev": rec_elev,
                     "passes": schedule(st.get("min_elev", 15)),
                     "captures": read_captures(),
+                    "balloons": balloon_state(),
                 }))
             if u.path == "/api/sdr":
                 return self._send(200, json.dumps(check_sdr()))

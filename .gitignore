@@ -1,0 +1,16 @@
+# captures + lab state (huge IQ files, per-run telemetry, TLE cache)
+lab/
+*.cs16
+*.cs16.json
+*.wav
+*.png
+!assets/*.png
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# os
+Thumbs.db
+.DS_Store

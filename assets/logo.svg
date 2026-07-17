@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240" fill="none">
+  <!-- badge background -->
+  <rect x="4" y="4" width="232" height="232" rx="30" fill="#0d1014" stroke="#1c2530" stroke-width="2"/>
+
+  <!-- incoming signal arcs (reception) -->
+  <g stroke="#33d0c4" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.55">
+    <path d="M150 48 a30 30 0 0 1 26 16"/>
+    <path d="M158 36 a48 48 0 0 1 42 24"/>
+  </g>
+
+  <!-- stand -->
+  <path d="M120 150 L110 208" stroke="#6b7580" stroke-width="8" stroke-linecap="round"/>
+  <path d="M110 208 L92 216 M110 208 L128 216" stroke="#6b7580" stroke-width="7" stroke-linecap="round"/>
+
+  <!-- dish body -->
+  <path d="M40 120 Q120 216 200 120 Z" fill="#123039"/>
+  <ellipse cx="120" cy="120" rx="80" ry="26" fill="#0a0d11"/>
+  <!-- water -->
+  <ellipse cx="120" cy="123" rx="71" ry="20" fill="#33d0c4" opacity="0.35"/>
+  <ellipse cx="120" cy="120" rx="80" ry="26" fill="none" stroke="#33d0c4" stroke-width="4"/>
+  <!-- ripples -->
+  <path d="M92 130 q10 6 20 0" stroke="#33d0c4" stroke-width="2" opacity="0.7"/>
+  <path d="M136 118 q8 5 16 0" stroke="#33d0c4" stroke-width="2" opacity="0.6"/>
+
+  <!-- feed tripod + horn -->
+  <g stroke="#6b7580" stroke-width="3" stroke-linecap="round">
+    <path d="M64 116 L120 66"/>
+    <path d="M176 116 L120 66"/>
+  </g>
+  <circle cx="120" cy="62" r="7" fill="#ffb43a"/>
+
+  <!-- swimming bird -->
+  <ellipse cx="104" cy="116" rx="17" ry="10" fill="#ffb43a"/>
+  <circle cx="90" cy="106" r="8" fill="#ffb43a"/>
+  <path d="M83 105 l-9 2 l9 3 Z" fill="#ff5c4d"/>
+  <circle cx="91" cy="104" r="1.7" fill="#0d1014"/>
+  <path d="M108 112 q6 -5 12 -2" stroke="#e0972a" stroke-width="2" fill="none"/>
+
+  <!-- bird perched on the rim -->
+  <ellipse cx="176" cy="107" rx="11" ry="7" fill="#ffb43a"/>
+  <circle cx="185" cy="100" r="5.5" fill="#ffb43a"/>
+  <path d="M190 99 l7 1 l-7 2 Z" fill="#ff5c4d"/>
+  <circle cx="186" cy="99" r="1.3" fill="#0d1014"/>
+
+  <!-- gull overhead -->
+  <path d="M148 46 q8 -7 15 0 q7 -7 15 0" stroke="#ffb43a" stroke-width="3" fill="none" stroke-linecap="round"/>
+</svg>

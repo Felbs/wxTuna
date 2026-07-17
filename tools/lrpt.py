@@ -26,6 +26,7 @@ against the first real locked pass - you cannot debug those blind. Run this on
 tonight's 22:11 M2-3 capture and we close that loop.
 """
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -248,6 +249,29 @@ def read_iq(path):
     return iq.astype(np.complex64), fs
 
 
+def capture_fs(path):
+    """Sample rate from the sidecar json (250k default) - no IQ read needed."""
+    import json
+    side = Path(str(path) + ".json")
+    if side.exists():
+        try:
+            return float(json.loads(side.read_text()).get("fs_hz", 250_000.0))
+        except Exception:
+            pass
+    return 250_000.0
+
+
+def read_iq_slice(path, offset_s, secs, fs):
+    """Read ONLY the requested window from disk (memory = window, not file)."""
+    path = Path(path)
+    total = path.stat().st_size // 4          # complex samples on disk
+    start = max(0, min(int(offset_s * fs), total))
+    n = max(0, min(int(secs * fs), total - start))
+    raw = np.fromfile(path, dtype=np.int16, count=2 * n, offset=start * 4)
+    iq = (raw[0::2].astype(np.float32) + 1j * raw[1::2].astype(np.float32)) / 32768.0
+    return iq.astype(np.complex64)
+
+
 def rrc_taps(beta, sps, span=8):
     N = span * sps
     t = (np.arange(-N, N + 1)) / sps
@@ -320,6 +344,92 @@ def demod(iq, fs, beta=0.6):
         freq += b * err
         phase += freq + a * err
     # MER dial: how tightly symbols cluster on the QPSK constellation
+    ideal = (np.sign(np.real(rec)) + 1j * np.sign(np.imag(rec))) / np.sqrt(2)
+    rec_n = rec / (np.sqrt(np.mean(np.abs(rec) ** 2)) + 1e-9)
+    err_pow = np.mean(np.abs(rec_n - ideal) ** 2) + 1e-9
+    mer_db = 10 * np.log10(1.0 / err_pow)
+    info = {"n_symbols": len(rec), "mer_db": round(float(mer_db), 2),
+            "locked": bool(mer_db > 6.0)}
+    return rec, info
+
+
+# --- fast demod (numba-jitted Gardner + Costas, preallocated) --------------
+# Same math as demod() above, which stays as the validation oracle. The pure-
+# python loops box millions of numpy scalars (slow + fragments the allocator -
+# observed 31 GB RSS on one 25 s window); these kernels allocate two arrays.
+def _gardner_impl(x, sps, gain):
+    N = x.shape[0]
+    cap = int(N / (sps - 0.2)) + 16
+    out = np.empty(cap, np.complex128)
+    n = 0
+    i = float(sps)
+    prev_re = 0.0
+    prev_im = 0.0
+    half = sps / 2.0
+    while i < N - 2 and n < cap:
+        base = int(i)
+        frac = i - base
+        sre = x[base].real * (1 - frac) + x[base + 1].real * frac
+        sim = x[base].imag * (1 - frac) + x[base + 1].imag * frac
+        m = i - half
+        mb = int(m)
+        mf = m - mb
+        mre = x[mb].real * (1 - mf) + x[mb + 1].real * mf
+        mim = x[mb].imag * (1 - mf) + x[mb + 1].imag * mf
+        e = mre * (prev_re - sre) + mim * (prev_im - sim)
+        out[n] = complex(sre, sim)
+        n += 1
+        prev_re = sre
+        prev_im = sim
+        i += sps + gain * e
+    return out[:n]
+
+
+def _costas_impl(syms, a, b):
+    n = syms.shape[0]
+    rec = np.empty(n, np.complex128)
+    phase = 0.0
+    freq = 0.0
+    for k in range(n):
+        c = math.cos(phase)
+        s = math.sin(phase)
+        xr = syms[k].real
+        xi = syms[k].imag
+        vre = xr * c + xi * s
+        vim = xi * c - xr * s
+        rec[k] = complex(vre, vim)
+        sgn_r = 1.0 if vre > 0.0 else (-1.0 if vre < 0.0 else 0.0)
+        sgn_i = 1.0 if vim > 0.0 else (-1.0 if vim < 0.0 else 0.0)
+        err = sgn_r * vim - sgn_i * vre
+        freq += b * err
+        phase += freq + a * err
+    return rec
+
+
+if _HAVE_NUMBA:
+    _gardner = njit(cache=True)(_gardner_impl)
+    _costas = njit(cache=True)(_costas_impl)
+else:
+    _gardner = _gardner_impl
+    _costas = _costas_impl
+
+
+def demod_fast(iq, fs, beta=0.6):
+    """Same pipeline as demod() with the two feedback loops jitted.
+    Identical math; validated against the reference in selftest."""
+    from scipy.signal import resample_poly
+    from math import gcd
+    iq = iq - np.mean(iq)
+    up = int(2 * SYM_RATE)
+    down = int(fs)
+    g = gcd(up, down)
+    x = resample_poly(iq, up // g, down // g).astype(np.complex64)
+    sps = 2
+    h = rrc_taps(beta, sps)
+    x = np.convolve(x, h, mode="same").astype(np.complex64)
+    x /= (np.sqrt(np.mean(np.abs(x) ** 2)) + 1e-9)
+    syms = _gardner(x.astype(np.complex128), float(sps), 0.02)
+    rec = _costas(syms, 0.01, 0.01 ** 2 / 4).astype(np.complex64)
     ideal = (np.sign(np.real(rec)) + 1j * np.sign(np.imag(rec))) / np.sqrt(2)
     rec_n = rec / (np.sqrt(np.mean(np.abs(rec) ** 2)) + 1e-9)
     err_pow = np.mean(np.abs(rec_n - ideal) ** 2) + 1e-9
@@ -447,6 +557,44 @@ def selftest_demod():
     return ok
 
 
+def _synthetic_qpsk(nsym=6000, seed=3):
+    """The selftest_demod signal generator, shared with the fast-demod test."""
+    rng = np.random.default_rng(seed)
+    syms = (rng.integers(0, 2, nsym) * 2 - 1) + 1j * (rng.integers(0, 2, nsym) * 2 - 1)
+    syms = syms.astype(np.complex64) / np.sqrt(2)
+    sps0 = 250_000 / SYM_RATE
+    base = np.zeros(int(nsym * sps0) + 10, np.complex64)
+    idx = (np.arange(nsym) * sps0).astype(int)
+    base[idx] = syms
+    h = rrc_taps(0.6, 8)
+    tx = np.convolve(base, np.interp(np.linspace(0, len(h) - 1, int(len(h) * sps0 / 8)),
+                                     np.arange(len(h)), h), mode="same").astype(np.complex64)
+    t = np.arange(len(tx))
+    tx = tx * np.exp(1j * 2 * np.pi * 800 / 250_000 * t)
+    tx += (rng.normal(0, 0.05, len(tx)) + 1j * rng.normal(0, 0.05, len(tx))).astype(np.complex64)
+    return tx
+
+
+def selftest_demod_fast():
+    import time
+    print("[selftest] fast demod - matches reference + speed"
+          + ("" if _HAVE_NUMBA else "  (numba MISSING: python fallback)"))
+    tx = _synthetic_qpsk()
+    t0 = time.time(); rec_r, info_r = demod(tx, 250_000.0); t_ref = time.time() - t0
+    t0 = time.time(); rec_f, info_f = demod_fast(tx, 250_000.0); t_warm = time.time() - t0
+    t0 = time.time(); rec_f, info_f = demod_fast(tx, 250_000.0); t_fast = time.time() - t0
+    dmer = abs(info_r["mer_db"] - info_f["mer_db"])
+    same_lock = info_r["locked"] == info_f["locked"]
+    print(f"   reference: MER {info_r['mer_db']} dB locked={info_r['locked']} in {t_ref:.2f}s")
+    print(f"   fast     : MER {info_f['mer_db']} dB locked={info_f['locked']} in {t_fast:.3f}s"
+          f"  (JIT compile pass took {t_warm:.1f}s)")
+    print(f"   agreement: dMER={dmer:.2f} dB, lock match={same_lock}, "
+          f"speedup {t_ref/max(t_fast,1e-9):.0f}x")
+    ok = same_lock and dmer < 0.5
+    print("   => fast demod", "VALIDATED\n" if ok else "MISMATCH\n")
+    return ok
+
+
 def cmd_selftest(args):
     print("=" * 62)
     print("LRPT engine self-test - validating the pieces we can prove now")
@@ -455,6 +603,8 @@ def cmd_selftest(args):
     af = selftest_viterbi_fast()
     b = selftest_pn()
     c = selftest_demod()
+    cf = selftest_demod_fast()
+    c = c and cf
     print("=" * 62)
     print(f"Viterbi {'PASS' if a and af else 'FAIL'} | derandomizer {'PASS' if b else 'FAIL'} "
           f"| demod {'PASS' if c else 'FAIL'}")
@@ -467,18 +617,27 @@ def cmd_decode(args):
     path = Path(args.capture)
     if not path.exists():
         sys.exit(f"no such capture: {path}")
-    print(f"[decode] reading {path.name} ...")
-    iq, fs = read_iq(path)
-    dur = len(iq) / fs
-    print(f"[decode] {len(iq)} samples, {dur:.1f}s @ {fs/1e3:.0f} kHz")
-    # analyze a chunk to keep pure-python Viterbi tractable
-    chunk = iq[: int(min(dur, args.secs) * fs)]
-    rec, info = demod(chunk, fs)
-    print(f"[decode] MER dial: {info['mer_db']} dB  (lock threshold ~6 dB)  "
-          f"locked={info['locked']}")
+    fs = capture_fs(path)
+    dur = (path.stat().st_size // 4) / fs
+    print(f"[decode] {path.name}: {dur:.1f}s @ {fs/1e3:.0f} kHz")
+    off = args.offset
+    if args.mid:
+        off = max(0.0, dur / 2 - args.secs / 2)   # seek to the pass peak
+    print(f"[decode] window: {off:.0f}s -> {off+args.secs:.0f}s (slice-read only)")
+    chunk = read_iq_slice(path, off, args.secs, fs)
+    rec, info = demod_fast(chunk, fs)
+    pol = "normal"
     if not info["locked"]:
-        print("[decode] no QPSK lock - likely no Meteor signal in this capture")
-        print("         (expected unless a pass was overhead). Constellation is noise.")
+        # IQ inversion is the #1 first-lock gotcha (spectrum mirrored by the
+        # SDR); try the conjugate and keep whichever clusters tighter.
+        rec2, info2 = demod_fast(np.conj(chunk), fs)
+        if info2["mer_db"] > info["mer_db"]:
+            rec, info, pol = rec2, info2, "IQ-conjugated"
+    print(f"[decode] MER dial: {info['mer_db']} dB  (lock threshold ~6 dB)  "
+          f"locked={info['locked']}  polarity={pol}")
+    if not info["locked"]:
+        print("[decode] no QPSK lock on either polarity - likely no Meteor signal")
+        print("         (if a pass WAS overhead, suspect the antenna port). Noise.")
         return
     print("[decode] LOCKED. Running Viterbi over a segment to search for ASMs ...")
     sb = qpsk_softbits(rec[: args.vitsyms])
@@ -500,6 +659,8 @@ def main():
     d = sub.add_parser("decode")
     d.add_argument("capture")
     d.add_argument("--secs", type=float, default=20, help="seconds of IQ to demod")
+    d.add_argument("--offset", type=float, default=0.0, help="seconds into the capture to start")
+    d.add_argument("--mid", action="store_true", help="seek to the pass peak (middle)")
     d.add_argument("--vitsyms", type=int, default=40000, help="symbols through Viterbi")
     args = ap.parse_args()
     if args.cmd == "selftest":

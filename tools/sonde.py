@@ -108,8 +108,17 @@ def fetch_radar(km=350):
     req = urllib.request.Request(url, headers={"User-Agent": "wxTuna-sonde"})
     data = json.loads(urllib.request.urlopen(req, timeout=20).read())
     sondes = []
+    now = datetime.now(timezone.utc)
     for serial, t in (data or {}).items():
         try:
+            # skip stale entries (landed/lost birds linger in the API for
+            # hours - we once hunted a corpse on the ground 87 km away)
+            dt = t.get("datetime", "")
+            if dt:
+                age = (now - datetime.fromisoformat(
+                    dt.replace("Z", "+00:00"))).total_seconds()
+                if age > 1200:
+                    continue
             lat, lon = float(t["lat"]), float(t["lon"])
             d = haversine_km(OBS_LAT, OBS_LON, lat, lon)
             sondes.append({
@@ -220,12 +229,48 @@ def _syncscan_impl(soft, sync_pm):
     return best[:nb], bestv[:nb]
 
 
+def _gardner_impl(d, sps, kp, ki):
+    """H3: proper Gardner timing recovery with a PI loop filter, replacing
+    the fixed-stride integrate-and-dump. Tracks clock offset AND drift -
+    the crude sync smeared 2560-bit frames beyond recognition at low SNR."""
+    N = d.shape[0]
+    cap = int(N / (sps * 0.97)) + 16
+    out = np.empty(cap, np.float32)
+    nb = 0
+    pos = sps
+    freq = sps
+    prev = 0.0
+    fmin = sps * 0.98
+    fmax = sps * 1.02
+    while pos < N - 2 and nb < cap:
+        i = int(pos)
+        fr = pos - i
+        s = d[i] * (1 - fr) + d[i + 1] * fr
+        m = pos - freq * 0.5
+        j = int(m)
+        mf = m - j
+        mid = d[j] * (1 - mf) + d[j + 1] * mf if j >= 0 else 0.0
+        e = mid * ((1.0 if s > 0 else -1.0) - (1.0 if prev > 0 else -1.0))
+        freq += ki * e
+        if freq < fmin:
+            freq = fmin
+        elif freq > fmax:
+            freq = fmax
+        pos += freq + kp * e
+        out[nb] = s
+        nb += 1
+        prev = s
+    return out[:nb]
+
+
 if _HAVE_NUMBA:
     _bitsync = njit(cache=True)(_bitsync_impl)
     _syncscan = njit(cache=True)(_syncscan_impl)
+    _gardner = njit(cache=True)(_gardner_impl)
 else:
     _bitsync = _bitsync_impl
     _syncscan = _syncscan_impl
+    _gardner = _gardner_impl
 
 
 def find_carrier(iq, fs, min_snr_db=6.0):
@@ -299,16 +344,29 @@ def detect_rs41(iq, fs):
     d = x[1:] * np.conj(x[:-1])
     disc = np.angle(d).astype(np.float32)
     disc -= np.float32(np.mean(disc))    # center the two FSK tones
-    soft = _bitsync(disc, target / BAUD)
-    hits, scores = _syncscan(soft, _SYNC_PM)
-    pol = "normal"
-    if len(hits) == 0:                   # RS41 tone mapping can be inverted
-        hits2, scores2 = _syncscan(-soft, _SYNC_PM)
-        if len(hits2) > 0:
-            hits, scores, pol = hits2, scores2, "inverted"
+    sync_used = "gardner"
+    soft = _gardner(disc, target / BAUD, 0.03, 0.0008)
+    hits, scores, pol = _scan_both(soft)
+    if len(hits) == 0:                   # A/B fallback: the old crude sync
+        soft2 = _bitsync(disc, target / BAUD)
+        h2, s2, p2 = _scan_both(soft2)
+        if len(h2) > 0:
+            hits, scores, pol, sync_used = h2, s2, p2, "integrate-dump"
+            soft = soft2
     return len(hits), {"hits": hits.tolist(), "scores": scores.tolist(),
                        "n_bits": len(soft), "carrier_off_hz": round(off),
-                       "carrier_snr_db": round(snr, 1), "polarity": pol}
+                       "carrier_snr_db": round(snr, 1), "polarity": pol,
+                       "sync": sync_used}
+
+
+def _scan_both(soft):
+    hits, scores = _syncscan(soft, _SYNC_PM)
+    if len(hits) > 0:
+        return hits, scores, "normal"
+    hits2, scores2 = _syncscan(-soft, _SYNC_PM)
+    if len(hits2) > 0:
+        return hits2, scores2, "inverted"
+    return hits, scores, "normal"
 
 
 # ==========================================================================

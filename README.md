@@ -52,6 +52,8 @@ python tools/weather_sat_panel.py          # -> http://localhost:8644
 python tools/lrpt.py selftest
 python tools/lrpt.py decode lab/wxsat/lrpt_*.cs16
 ```
+(`lab/` is empty on a fresh clone — the watch loop records passes into it;
+`lrpt.py decode` needs at least one recorded capture first.)
 Set your location with `WXSAT_LAT` / `WXSAT_LON` env vars (or `--lat/--lon`);
 the default is metro-coarse. Runs under **radioconda** (needs `SoapySDR`,
 `numpy`, `scipy`, `sgp4`, `numba`, `matplotlib`, `Pillow`).

@@ -625,6 +625,13 @@ def cmd_decode(args):
         off = max(0.0, dur / 2 - args.secs / 2)   # seek to the pass peak
     print(f"[decode] window: {off:.0f}s -> {off+args.secs:.0f}s (slice-read only)")
     chunk = read_iq_slice(path, off, args.secs, fs)
+    if args.shift_khz:
+        # wideband capture: mix the sub-band at +shift kHz down to DC first
+        # (resample_poly's anti-alias low-pass then rejects everything else)
+        t = np.arange(len(chunk), dtype=np.float64)
+        chunk = (chunk * np.exp(-2j * np.pi * args.shift_khz * 1e3 / fs * t)
+                 ).astype(np.complex64)
+        print(f"[decode] extracted sub-band at {args.shift_khz:+.0f} kHz from center")
     rec, info = demod_fast(chunk, fs)
     pol = "normal"
     if not info["locked"]:
@@ -661,6 +668,8 @@ def main():
     d.add_argument("--secs", type=float, default=20, help="seconds of IQ to demod")
     d.add_argument("--offset", type=float, default=0.0, help="seconds into the capture to start")
     d.add_argument("--mid", action="store_true", help="seek to the pass peak (middle)")
+    d.add_argument("--shift-khz", type=float, default=0.0,
+                   help="sub-band offset from capture center in kHz (wideband captures)")
     d.add_argument("--vitsyms", type=int, default=40000, help="symbols through Viterbi")
     args = ap.parse_args()
     if args.cmd == "selftest":

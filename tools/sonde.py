@@ -473,7 +473,24 @@ def cmd_capture(args):
     print(f"[detect] RS41 sync hits: {n}"
           + (f"  scores {['%.0f' % s for s in det['scores'][:5]]}" if n else ""))
     if n:
-        print("  -> RS41 FRAMES DETECTED! next stage: dewhiten + RS(255,231) + GPS parse")
+        try:                # full decode: the 7/18 first-light pipeline
+            from rs41_decode import decode_capture
+            rows = [r for r in decode_capture(iq) if r["gps_ok"]]
+            if rows:
+                r = rows[-1]
+                print(f"[DECODE] {len(rows)} CRC-verified frames - "
+                      f"{r['serial']} @ {r['lat']:.4f},{r['lon']:.4f} "
+                      f"{r['alt_m']:.0f} m  {r['v_kmh']:.0f} km/h  "
+                      f"batt {r['batt_v']:.1f} V")
+                with open(SONDE_DIR.parent / "sonde_track.jsonl", "a") as tf:
+                    for r in rows:
+                        r["capture"] = out.name
+                        tf.write(json.dumps(r) + "\n")
+            else:
+                print("[DECODE] sync found but no CRC-verified frames "
+                      "(weak signal - IQ saved for replay)")
+        except Exception as e:
+            print(f"[DECODE] decode error: {e}")
     return n
 
 

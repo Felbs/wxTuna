@@ -58,6 +58,14 @@ BAUD = 4800.0
 # RS41 whitened frame header (the 8-byte sync every receiver correlates on;
 # confirmed against live frames on first catch - flagged until then)
 RS41_SYNC = bytes([0x86, 0x35, 0xF4, 0x40, 0x93, 0xDF, 0x1A, 0x60])
+# ^ those are the DE-WHITENED header bytes (what lands in the decoded
+# frame). What actually FLIES is the whitened bit pattern below - the
+# sync correlator must hunt the on-air bits, not the frame bytes.
+# (Verified 7/18 against rs41mod.c:170 after our correlator scored
+# chance on a live capture with a +16 dB clock line - ledger law #1:
+# selftests prove machinery, only live signals prove constants.)
+RS41_SYNC_ONAIR = ("00001000011011010101001110001000"
+                   "01000100011010010100100000011111")
 SONDEHUB = ("https://api.v2.sondehub.org/sondes"
             "?lat={lat}&lon={lon}&distance={m}&last=10800")   # distance in METERS
 
@@ -171,7 +179,8 @@ def _bits_from_bytes(bb):
     return out
 
 
-_SYNC_PM = (_bits_from_bytes(RS41_SYNC) * 2 - 1).astype(np.float32)
+_SYNC_PM = (np.array([int(c) for c in RS41_SYNC_ONAIR], np.int8)
+            * 2 - 1).astype(np.float32)
 
 
 def _bitsync_impl(disc, sps):
@@ -494,8 +503,12 @@ def cmd_selftest(args):
     sps_tx = fs / BAUD
     # frame: preamble + sync + random payload, GFSK at +/-2.4 kHz deviation
     payload = rng.integers(0, 256, 300, dtype=np.uint8).tobytes()
-    frame = b"\xAA" * 8 + RS41_SYNC + payload
-    bits = _bits_from_bytes(frame)
+    # transmit what actually flies: preamble bits + ON-AIR (whitened)
+    # sync pattern + payload bits
+    bits = np.concatenate([
+        _bits_from_bytes(b"\xAA" * 8),
+        np.array([int(c) for c in RS41_SYNC_ONAIR], np.uint8),
+        _bits_from_bytes(payload)])
     # build the FSK phase ramp
     dev = 2400.0
     t_total = int(len(bits) * sps_tx) + 1000

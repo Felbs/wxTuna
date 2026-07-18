@@ -393,7 +393,32 @@ def cmd_watch(args):
         secs = (los + timedelta(seconds=TAIL_S) - utcnow()).total_seconds()
         if secs < 30:
             continue   # missed it / too short; loop picks the next
-        do_record(FREQ_HZ, secs, args, sat=nxt["sat"], aos=aos, los=los)
+        cap_path = do_record(FREQ_HZ, secs, args, sat=nxt["sat"], aos=aos,
+                             los=los)
+        # H8 reactivation tripwire: MER-check the pass peak so the day
+        # Meteor's LRPT wakes up we KNOW immediately, not days later
+        try:
+            if isinstance(cap_path, dict) and cap_path.get("file"):
+                latest = Path(cap_path["file"])
+            else:
+                latest = max(CAP_DIR.glob("lrpt_*.cs16"),
+                             key=lambda p: p.stat().st_mtime)
+            import subprocess as _sp
+            r = _sp.run([sys.executable, str(HERE / "lrpt.py"), "decode",
+                         "--mid", str(latest)], capture_output=True,
+                        text=True, timeout=600)
+            blob = (r.stdout or "")
+            mer_line = next((l for l in blob.splitlines() if "MER dial" in l),
+                            "").strip()
+            print(f"[watch] post-pass check: {mer_line}")
+            if "locked=True" in blob:
+                print("*" * 62)
+                print("*** METEOR LRPT LOCK - THE BIRD IS BACK - TELL THE "
+                      "HUMAN! ***")
+                print("*" * 62)
+                write_status(note="METEOR LRPT LOCKED - reactivation caught!")
+        except Exception as e:
+            print(f"[watch] post-pass check skipped: {e}")
         _sleep_interruptible(10)   # gap so we don't re-detect the same pass
 
 

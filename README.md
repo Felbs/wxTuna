@@ -83,3 +83,15 @@ birds splashing in a satellite dish. 🐦
 *Part of the Tuna family: [TV Tuna](https://github.com/Felbs/Software-TV-Tuner)
 · [Radio Tuna](https://github.com/Felbs/gr-radiotuna) · wxTuna. Every digital
 decoder secretly knows how well it's doing — adaptive decoding closes the loop.*
+
+## Acknowledgments
+- **[rs1729/RS](https://github.com/rs1729/RS)** — `tools/sonde_rx.py`
+  drives rs1729's `rs41mod` decoder (the same core radiosonde_auto_rx
+  uses) for all RS41 frame decoding. The demodulation-to-telemetry
+  magic is entirely their work; we provide the capture front end and
+  the hunt loop. Compiled from their source, licensed per their repo.
+- **[radiosonde_auto_rx](https://github.com/projecthorus/radiosonde_auto_rx)**
+  (Project Horus) — the operational model (scan, decode, log,
+  unattended) that shaped our hunt loop.
+- **[sigidwiki](https://www.sigidwiki.com/)** — reference recordings
+  used to validate the decode chain end-to-end.

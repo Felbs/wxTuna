@@ -123,8 +123,13 @@ def cmd_hunt(args):
           f"{args.secs:.0f}s per pass", flush=True)
     buf = np.zeros(262144, np.complex64)
     logf = LAB / f"sonde_log_{time.strftime('%Y%m%d')}.txt"
+    t_hunt0 = time.time()
+    dry = 0
     try:
         while True:
+            if args.duration and (time.time() - t_hunt0) > args.duration * 60:
+                print("[hunt] duration reached - standing down", flush=True)
+                break
             ch = []
             t0 = time.time()
             while time.time() - t0 < args.secs:
@@ -147,7 +152,46 @@ def cmd_hunt(args):
                     for ln in frames:
                         f.write(f"{stamp} {ln.strip()}\n")
             else:
+                dry += 1
                 print(f"[{stamp}] no frames (sonde weak/absent)", flush=True)
+                # sondes rotate channels between flights: every 3rd dry
+                # pass, sweep the whole 400-406 band for a wide FSK
+                # signal and re-aim (the lesson of the silent evening)
+                if dry % 3 == 0:
+                    sdr.setSampleRate(SOAPY_SDR_RX, 0, 8e6)
+                    sdr.setFrequency(SOAPY_SDR_RX, 0, 403e6)
+                    ch2 = []
+                    t1 = time.time()
+                    while time.time() - t1 < 3:
+                        r2 = sdr.readStream(st, [buf], len(buf),
+                                            timeoutUs=800000)
+                        if r2.ret > 0:
+                            ch2.append(buf[:r2.ret].copy())
+                    xs = np.concatenate(ch2) if ch2 else np.zeros(4096, np.complex64)
+                    nn2 = 1 << 20
+                    S = np.abs(np.fft.fftshift(
+                        np.fft.fft(xs[:nn2] * np.hanning(min(nn2, len(xs))))))**2
+                    fgrid = (np.fft.fftshift(np.fft.fftfreq(nn2, 1/8e6)) + 403e6)
+                    P = 10*np.log10(S + 1e-20)
+                    floor = np.median(P)
+                    Pm = P.copy()
+                    found = None
+                    for _k in range(6):
+                        i2 = int(np.argmax(Pm))
+                        if Pm[i2] < floor + 12:
+                            break
+                        span = np.where(P[max(0, i2-3000):i2+3000] > P[i2]-15)[0]
+                        bw = (span.max()-span.min())*(8e6/nn2) if len(span) else 0
+                        if 3000 < bw < 40000:      # sonde-like FSK width
+                            found = fgrid[i2] / 1e6
+                            break
+                        Pm[max(0, i2-4000):i2+4000] = floor
+                    sdr.setSampleRate(SOAPY_SDR_RX, 0, FS)
+                    if found and abs(found - args.mhz) > 0.01:
+                        args.mhz = round(found, 3)
+                        print(f"[hunt] band scan: sonde-like signal at "
+                              f"{args.mhz:.3f} MHz - re-aiming", flush=True)
+                    sdr.setFrequency(SOAPY_SDR_RX, 0, args.mhz * 1e6 + 100e3)
             if args.once:
                 break
     except KeyboardInterrupt:
@@ -172,6 +216,8 @@ def main():
     h.add_argument("--mhz", type=float, default=404.000)
     h.add_argument("--secs", type=float, default=120)
     h.add_argument("--once", action="store_true")
+    h.add_argument("--duration", type=float, default=0,
+                   help="stop after N minutes (0 = forever)")
     args = ap.parse_args()
     sys.exit(cmd_decode(args) if args.cmd == "decode" else cmd_hunt(args))
 

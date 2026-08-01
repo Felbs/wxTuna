@@ -99,14 +99,61 @@ def cmd_hunt(args):
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
-    for attempt in range(5):
+
+    # ── WARDEN REGISTRATION (2026-07-30) ────────────────────────────────────
+    # Why this exists: the 06:40 hunt on 7/30 died instantly with
+    # "no available RSP devices found". prop_atlas had begun a sweep the same
+    # minute (10:40:29Z) and holds the radio for ~13 MINUTES, while the retry
+    # ladder below only spans ~12 s.
+    #
+    # The fix is NOT a longer ladder. prop_atlas is already a good citizen — it
+    # acquires via radio_lock at priority 20 (background) and polls
+    # should_yield() mid-sweep — but this hunt opened the device DIRECTLY and
+    # never registered intent, so the want-file was never written, the atlas
+    # never learned anyone wanted the radio, and the cooperative preemption that
+    # was sitting there ready to work could not fire.
+    #
+    # A scheduled sonde pass is a timed event that cannot be retried later (the
+    # balloon is gone), so it takes priority 100 — the sat-pass tier — and waits
+    # for the holder to yield rather than racing it. Degrades gracefully: if
+    # radio_lock is unavailable we fall through to the bare open exactly as
+    # before, so this can never be the reason a hunt fails.
+    _lock = None
+    try:
+        import radio_lock
+        _lock = radio_lock.Holder("sonde_rx", f"radiosonde hunt {args.mhz:.3f} MHz",
+                                  100, wait_s=float(os.environ.get(
+                                      "SONDE_LOCK_WAIT", "180")))
+        _lock.__enter__()
+        if not getattr(_lock, "ok", True):
+            print("[hunt] warden: radio busy and would not yield — "
+                  "continuing anyway (best effort)", flush=True)
+        else:
+            print("[hunt] warden: radio acquired at priority 100 (sat-pass tier)",
+                  flush=True)
+    except ImportError:
+        print("[hunt] warden unavailable (radio_lock not importable) — "
+              "opening directly", flush=True)
+    except Exception as e:
+        print(f"[hunt] warden acquire failed ({e}) — opening directly", flush=True)
+
+    # Backstop ladder. Widened 5x3s -> 10x6s (~60 s) so a holder that is mid-
+    # release still has room to let go, but the warden above is what actually
+    # prevents the collision.
+    sdr = None
+    for attempt in range(10):
         try:
             sdr = SoapySDR.Device("driver=sdrplay")
             break
         except Exception:
-            if attempt == 4:
+            if attempt == 9:
+                if _lock is not None:
+                    try:
+                        _lock.__exit__(None, None, None)
+                    except Exception:
+                        pass
                 raise
-            time.sleep(3)
+            time.sleep(6)
     FS = 1e6
     sdr.setSampleRate(SOAPY_SDR_RX, 0, FS)
     sdr.setFrequency(SOAPY_SDR_RX, 0, args.mhz * 1e6 + 100e3)  # DC offside
@@ -132,10 +179,24 @@ def cmd_hunt(args):
                 break
             ch = []
             t0 = time.time()
+            _hb = t0
             while time.time() - t0 < args.secs:
                 r = sdr.readStream(st, [buf], len(buf), timeoutUs=800000)
                 if r.ret > 0:
                     ch.append(buf[:r.ret].copy())
+                # HEARTBEAT (2026-07-31): registering with the warden is not
+                # enough — the lock's TTL is 90 s, and a capture that streams
+                # for minutes without heartbeating goes STALE mid-window. On
+                # 7/31 the atlas swept this hunt's silent lock and tried to
+                # open a device the hunt still physically held ("SDR would
+                # not open" x2). A holder that cannot be heard from is
+                # indistinguishable from a dead one, by design — so speak.
+                if _lock is not None and time.time() - _hb > 30:
+                    try:
+                        radio_lock.heartbeat()
+                    except Exception:
+                        pass
+                    _hb = time.time()
             x = np.concatenate(ch)
             n = np.arange(len(x), dtype=np.float64)
             x = (x * np.exp(-2j * np.pi * (-100e3) / FS * n)).astype(np.complex64)
@@ -202,6 +263,15 @@ def cmd_hunt(args):
             sdr.closeStream(st)
         except Exception:
             pass
+        # Release the warden hold LAST, after the device is closed — otherwise a
+        # waiter (prop_atlas resuming its sweep) can win the lock and try to open
+        # a radio we have not let go of yet.
+        if _lock is not None:
+            try:
+                _lock.__exit__(None, None, None)
+                print("[hunt] warden: radio released", flush=True)
+            except Exception:
+                pass
     return 0
 
 

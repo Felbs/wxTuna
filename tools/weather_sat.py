@@ -35,6 +35,16 @@ from pathlib import Path
 
 import numpy as np
 
+# one-radio reservation (pass 100 > human 80 > lab 50 > warden 20);
+# labs poll wxsat_status.json pass windows too, but the lock is what
+# lets a pass PREEMPT a held session via the want-file instead of
+# silently losing the device-open race
+sys.path.insert(0, r"Z:\src\gr-radiotuna\tools")
+try:
+    import radio_lock
+except Exception:
+    radio_lock = None
+
 
 def _ensure_sdr_dll_path():
     """Make SoapySDR's driver modules loadable even when launched via a bare
@@ -278,6 +288,8 @@ def capture_to_file(sdr, st, out_path, n_seconds, actual_fs, sat,
             now = time.time()
             if live and now - last_stat >= 1.5:
                 last_stat = now
+                if radio_lock:
+                    radio_lock.heartbeat()   # lock TTL 90 s < pass length
                 write_status(state="recording", sat=sat,
                              elapsed_s=round(now - start, 1),
                              target_s=round(n_seconds, 1),
@@ -301,13 +313,34 @@ def do_record(freq_hz, secs, args, sat="manual", aos=None, los=None):
     stamp = utcnow().strftime("%Y%m%d_%H%M%S")
     tag = sat.replace(" ", "").replace("-", "")
     out = CAP_DIR / f"lrpt_{tag}_{stamp}.cs16"
-    try:
-        sdr, st, actual_fs = open_sdr(freq_hz, args.fs, args.driver,
-                                      args.antenna, args.gain)
-    except Exception as e:
-        print(f"[sdr] open failed: {e}")
-        write_status(state="error", sat=sat, note=f"SDR open failed: {e}")
-        return None
+    prio = 100 if sat != "manual" else 80
+    if radio_lock and not radio_lock.acquire(
+            "wxsat_pass", f"{sat} @ {freq_hz/1e6:.3f} MHz", prio, wait_s=60):
+        h = radio_lock.status() or {}
+        print(f"[lock] radio held by {h.get('owner','?')} after 60 s - "
+              f"attempting anyway (a pass cannot be rescheduled)")
+    # RETRY THROUGH THE PASS: a one-shot open lost the 00:55Z 7/20
+    # pass to a listening session that took 20 s to yield. Keep
+    # trying until most of the pass is gone — a 10-min tail beats
+    # nothing.
+    sdr = None
+    deadline = utcnow() + timedelta(seconds=min(max(secs - 60, 30), 600))
+    while True:
+        try:
+            sdr, st, actual_fs = open_sdr(freq_hz, args.fs, args.driver,
+                                          args.antenna, args.gain)
+            break
+        except Exception as e:
+            if utcnow() >= deadline:
+                print(f"[sdr] open failed through the window: {e}")
+                write_status(state="error", sat=sat,
+                             note=f"SDR open failed: {e}")
+                if radio_lock:
+                    radio_lock.release("wxsat_pass")
+                return None
+            write_status(state="waiting-for-radio", sat=sat,
+                         note=str(e)[:80])
+            time.sleep(8)
     print(f"[cap] {sat}: recording -> {out.name} @ {freq_hz/1e6:.3f} MHz, "
           f"fs={actual_fs/1e3:.0f}k, up to {secs:.0f}s")
     stop_at = utcnow() + timedelta(seconds=secs)
@@ -320,6 +353,8 @@ def do_record(freq_hz, secs, args, sat="manual", aos=None, los=None):
             sdr.closeStream(st)
         except Exception:
             pass
+        if radio_lock:
+            radio_lock.release("wxsat_pass")
     meta = {
         "ts": utcnow().isoformat(timespec="seconds") + "Z",
         "sat": sat, "file": str(out), "freq_hz": freq_hz,

@@ -81,7 +81,12 @@ TLE_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=weather&FORMAT=tle"
 TLE_MAX_AGE_H = 12.0
 SATS = ["METEOR-M2 3", "METEOR-M2 4"]
 FREQ_HZ = 137.9e6
-DEFAULT_FS = 250_000          # LRPT occupies ~140 kHz; 250 k is comfy (~1 MB/s)
+DEFAULT_FS = 250_000   # rate-ok: FILE rate only (LRPT occupies ~140 kHz).
+#                        The DEVICE opens at CAP_FS and a streaming 125/1024
+#                        decimator writes this rate to disk - law 8/01: the
+#                        RSPdx 250 kS/s hardware path is phase-corrupt;
+#                        capture >=2.048M, decimate in software.
+CAP_FS = 2_048_000     # device capture rate (never ask the RSPdx for less)
 LEAD_S = 20                   # start recording this many s before AOS
 TAIL_S = 20                   # ... and keep going this long past LOS
 
@@ -224,8 +229,11 @@ def open_sdr(freq_hz, fs, driver, antenna, gain_db):
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
     sdr = SoapySDR.Device(f"driver={driver}")
+    # law 8/01: never open the device below 2.048M - the low-rate hardware
+    # path is phase-corrupt. fs here is the desired FILE rate; the device
+    # runs at >= CAP_FS and capture_to_file decimates in software.
     try:
-        sdr.setSampleRate(SOAPY_SDR_RX, 0, fs)
+        sdr.setSampleRate(SOAPY_SDR_RX, 0, max(fs, CAP_FS))
     except Exception:
         sdr.setSampleRate(SOAPY_SDR_RX, 0, 2_000_000)   # SDRplay fallback
     actual_fs = sdr.getSampleRate(SOAPY_SDR_RX, 0)
@@ -263,13 +271,84 @@ def _rms_dbfs(i16buf):
     return 10 * math.log10(p / (32768.0 ** 2))
 
 
+class _StreamDecimator:
+    """Chunked polyphase decimation with an overlap-carry (the storm_watch
+    feed() pattern) so chunk edges never glitch the phase. Feeds interleaved
+    int16 IQ at the device rate, yields interleaved int16 IQ at the file
+    rate. Exists because of law 8/01: the device must run >=2.048M while
+    the LRPT pipeline keeps its 250k file contract."""
+
+    def __init__(self, up, down):
+        from scipy.signal import resample_poly   # bind once
+        self._rp = resample_poly
+        self.up, self.down = up, down
+        # margin > resample_poly's filter half-length (10*max(up,down) input
+        # samples), rounded to a multiple of `down` so the polyphase grids of
+        # consecutive chunks stay integer-aligned. Outputs inside the last
+        # `margin` inputs of a chunk are WITHHELD until the next chunk
+        # supplies their true continuation (emitting them against implicit
+        # zero-padding is a phase glitch every chunk - proven by the synth
+        # tone test in the doctor-sweep scratchpad).
+        self.margin = ((10 * max(up, down)) // down + 6) * down
+        self.pad = 2 * self.margin
+        self.carry = np.zeros(0, np.complex64)
+        self.rem = np.zeros(0, np.int16)         # raw pairs awaiting a chunk
+
+    def _emit(self, x, final=False):
+        buf = np.concatenate([self.carry, x])
+        c = len(self.carry)
+        y = self._rp(buf, self.up, self.down)
+        a = max(0, c - self.margin) * self.up // self.down
+        if final:
+            out = y[a:]
+        else:
+            b = (c + len(x) - self.margin) * self.up // self.down
+            out = y[a:b]
+            self.carry = buf[-self.pad:]
+        o = np.empty(2 * len(out), np.int16)
+        o[0::2] = np.clip(out.real, -32768, 32767).astype(np.int16)
+        o[1::2] = np.clip(out.imag, -32768, 32767).astype(np.int16)
+        return o.tobytes()
+
+    def feed(self, raw_i16):
+        raw = (np.concatenate([self.rem, raw_i16]) if len(self.rem)
+               else raw_i16)
+        n_take = (len(raw) // 2 // self.down) * self.down
+        if n_take < 2 * self.pad:        # wait for a comfortable chunk
+            self.rem = raw
+            return b""
+        self.rem = raw[2 * n_take:]
+        x = (raw[0:2 * n_take:2].astype(np.float32)
+             + 1j * raw[1:2 * n_take:2].astype(np.float32)
+             ).astype(np.complex64)
+        return self._emit(x)
+
+    def finish(self):
+        """Flush the withheld tail at end of capture."""
+        n = len(self.rem) // 2
+        x = (self.rem[0:2 * n:2].astype(np.float32)
+             + 1j * self.rem[1:2 * n:2].astype(np.float32)
+             ).astype(np.complex64)
+        self.rem = np.zeros(0, np.int16)
+        return self._emit(x, final=True)
+
+
 def capture_to_file(sdr, st, out_path, n_seconds, actual_fs, sat,
-                    stop_at=None, live=False):
-    """Stream CS16 IQ to out_path. Returns (n_samples, bytes)."""
+                    stop_at=None, live=False, file_fs=None):
+    """Stream CS16 IQ to out_path at file_fs (device runs at actual_fs;
+    software-decimated when they differ - law 8/01). Returns
+    (n_file_samples, bytes_written)."""
     import SoapySDR
+    file_fs = file_fs or actual_fs
+    dec = None
+    if abs(file_fs - actual_fs) > 1:
+        g = math.gcd(int(round(file_fs)), int(round(actual_fs)))
+        dec = _StreamDecimator(int(round(file_fs)) // g,
+                               int(round(actual_fs)) // g)
     n_want = int(n_seconds * actual_fs)
     buf = np.empty(2 * 65536, np.int16)
     got = 0
+    n_out = 0
     start = time.time()
     last_stat = 0.0
     level = -99.0
@@ -279,7 +358,12 @@ def capture_to_file(sdr, st, out_path, n_seconds, actual_fs, sat,
                 break
             r = sdr.readStream(st, [buf], 65536, timeoutUs=1_000_000)
             if r.ret > 0:
-                f.write(buf[:2 * r.ret].tobytes())
+                if dec is not None:
+                    b = dec.feed(buf[:2 * r.ret].copy())
+                else:
+                    b = buf[:2 * r.ret].tobytes()
+                f.write(b)
+                n_out += len(b) // 4
                 got += r.ret
                 level = _rms_dbfs(buf[:2 * r.ret])
             elif r.ret < 0 and r.ret != -1:   # -1 = timeout, tolerable
@@ -293,10 +377,14 @@ def capture_to_file(sdr, st, out_path, n_seconds, actual_fs, sat,
                 write_status(state="recording", sat=sat,
                              elapsed_s=round(now - start, 1),
                              target_s=round(n_seconds, 1),
-                             mb=round(got * 4 / 1e6, 1),
+                             mb=round(n_out * 4 / 1e6, 1),
                              level_dbfs=round(level, 1),
                              file=out_path.name)
-    return got, got * 4  # CS16 = 4 bytes/sample
+        if dec is not None:              # flush the withheld filter tail
+            b = dec.finish()
+            f.write(b)
+            n_out += len(b) // 4
+    return n_out, n_out * 4  # CS16 = 4 bytes/sample
 
 
 def write_sidecar(out_path, meta):
@@ -341,12 +429,15 @@ def do_record(freq_hz, secs, args, sat="manual", aos=None, los=None):
             write_status(state="waiting-for-radio", sat=sat,
                          note=str(e)[:80])
             time.sleep(8)
+    file_fs = min(float(args.fs), actual_fs)   # file keeps the LRPT contract
     print(f"[cap] {sat}: recording -> {out.name} @ {freq_hz/1e6:.3f} MHz, "
-          f"fs={actual_fs/1e3:.0f}k, up to {secs:.0f}s")
+          f"dev fs={actual_fs/1e3:.0f}k -> file fs={file_fs/1e3:.0f}k, "
+          f"up to {secs:.0f}s")
     stop_at = utcnow() + timedelta(seconds=secs)
     try:
         n, nbytes = capture_to_file(sdr, st, out, secs, actual_fs, sat,
-                                    stop_at=stop_at, live=True)
+                                    stop_at=stop_at, live=True,
+                                    file_fs=file_fs)
     finally:
         try:
             sdr.deactivateStream(st)
@@ -358,8 +449,9 @@ def do_record(freq_hz, secs, args, sat="manual", aos=None, los=None):
     meta = {
         "ts": utcnow().isoformat(timespec="seconds") + "Z",
         "sat": sat, "file": str(out), "freq_hz": freq_hz,
-        "fs_hz": actual_fs, "format": "cs16", "n_samples": n,
-        "bytes": nbytes, "dur_s": round(n / actual_fs, 1) if actual_fs else 0,
+        "fs_hz": file_fs, "dev_fs_hz": actual_fs,
+        "format": "cs16", "n_samples": n,
+        "bytes": nbytes, "dur_s": round(n / file_fs, 1) if file_fs else 0,
         "aos": aos.isoformat() + "Z" if aos else None,
         "los": los.isoformat() + "Z" if los else None,
         "obs": [OBS_LAT, OBS_LON],

@@ -38,7 +38,12 @@ _ensure_sdr_dll_path()
 LAB = HERE.parent / "lab"
 ALOG = LAB / "wx_alerts.jsonl"
 
-FS = 250_000.0
+FS = 250_000.0  # rate-ok: DEMOD rate only - capture happens at FS_SDR below,
+#                 decimated 125/1024 down to FS right after each block grab
+# CAPTURE AT 2.048M, NEVER 250k (law 8/01): the RSPdx 250 kS/s path delivers
+# phase-corrupt, amplitude-suppressed IQ on this box - fatal to the NBFM
+# discriminator this monitor lives on. Capture high, decimate in software.
+FS_SDR = 2_048_000.0
 AUD = 41_667.0          # 80 samples per 520.833 bd bit exactly
 BAUD = 520.8333
 MARK, SPACE = 2083.3333, 1562.5
@@ -175,7 +180,7 @@ def cmd_monitor(args):
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
     sdr = SoapySDR.Device("driver=sdrplay")
-    sdr.setSampleRate(SOAPY_SDR_RX, 0, FS)
+    sdr.setSampleRate(SOAPY_SDR_RX, 0, FS_SDR)
     sdr.setFrequency(SOAPY_SDR_RX, 0, args.khz * 1e3)
     try:
         sdr.setAntenna(SOAPY_SDR_RX, 0, args.antenna)
@@ -191,7 +196,7 @@ def cmd_monitor(args):
     g = gcd(int(AUD * 6), int(FS))
     try:
         while True:
-            n_want = int(8 * FS)
+            n_want = int(8 * FS_SDR)
             out = np.empty(2 * n_want, np.int16)
             got = 0
             while got < n_want:
@@ -202,6 +207,9 @@ def cmd_monitor(args):
                     got += n
             iq = ((out[0::2].astype(np.float32)
                    + 1j * out[1::2].astype(np.float32)) / 32768.0)
+            # decimate 2.048M -> 250k (exact 125/1024) per 8 s block; the
+            # discriminator and everything below keep their FS assumptions
+            iq = resample_poly(iq, 125, 1024).astype(np.complex64)
             disc = np.angle(iq[1:] * np.conj(iq[:-1])).astype(np.float32)
             audio = resample_poly(disc, int(AUD * 6) // g, int(FS) // g)
             audio = resample_poly(audio, 1, 6).astype(np.float32)

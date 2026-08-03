@@ -218,7 +218,7 @@ def cmd_hunt(args):
                 # sondes rotate channels between flights: every 3rd dry
                 # pass, sweep the whole 400-406 band for a wide FSK
                 # signal and re-aim (the lesson of the silent evening)
-                if dry % 3 == 0:
+                if dry % 3 == 0 and not args.pin:
                     sdr.setSampleRate(SOAPY_SDR_RX, 0, 8e6)
                     sdr.setFrequency(SOAPY_SDR_RX, 0, 403e6)
                     ch2 = []
@@ -286,6 +286,11 @@ def main():
     h.add_argument("--mhz", type=float, default=404.000)
     h.add_argument("--secs", type=float, default=120)
     h.add_argument("--once", action="store_true")
+    h.add_argument("--pin", action="store_true",
+                   help="hold the commanded frequency - no band-scan re-aim "
+                        "(the 8/02 lesson: a LOCAL sonde-like interferer at "
+                        "405.5/406.0 out-shouts a real distant sonde and "
+                        "steals the aim; pin when SondeHub says where to look)")
     h.add_argument("--duration", type=float, default=0,
                    help="stop after N minutes (0 = forever)")
     args = ap.parse_args()

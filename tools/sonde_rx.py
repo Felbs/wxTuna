@@ -197,6 +197,13 @@ def cmd_hunt(args):
                     except Exception:
                         pass
                     _hb = time.time()
+            if not ch:
+                # a starved pass (stream interrupted - e.g. an API service
+                # restart mid-hunt, 8/04) is ONE lost pass, not a lost hunt:
+                # log the void honestly and keep hunting.
+                print(f"[{time.strftime('%H:%M:%S')}] EMPTY PASS - 0 chunks "
+                      f"delivered (stream interrupted?), continuing", flush=True)
+                continue
             x = np.concatenate(ch)
             n = np.arange(len(x), dtype=np.float64)
             x = (x * np.exp(-2j * np.pi * (-100e3) / FS * n)).astype(np.complex64)

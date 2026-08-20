@@ -117,7 +117,9 @@ def cmd_hunt(args):
     # balloon is gone), so it takes priority 100 — the sat-pass tier — and waits
     # for the holder to yield rather than racing it. Degrades gracefully: if
     # radio_lock is unavailable we fall through to the bare open exactly as
-    # before, so this can never be the reason a hunt fails.
+    # before, so this can never be the reason a hunt fails. (8/20: an agent
+    # proposed 80 + stand-down; reverted — the 100/best-effort policy is
+    # deliberate, Felbs's call to change.)
     _lock = None
     try:
         import radio_lock
@@ -126,8 +128,10 @@ def cmd_hunt(args):
                                       "SONDE_LOCK_WAIT", "180")))
         _lock.__enter__()
         if not getattr(_lock, "ok", True):
-            print("[hunt] warden: radio busy and would not yield — "
-                  "continuing anyway (best effort)", flush=True)
+            h = radio_lock.status() or {}
+            print(f"[hunt] warden: radio busy ({h.get('owner','?')}, "
+                  f"{h.get('purpose','?')}) and would not yield - "
+                  f"continuing anyway (best effort)", flush=True)
         else:
             print("[hunt] warden: radio acquired at priority 100 (sat-pass tier)",
                   flush=True)
@@ -143,7 +147,7 @@ def cmd_hunt(args):
     sdr = None
     for attempt in range(10):
         try:
-            sdr = SoapySDR.Device("driver=sdrplay")
+            sdr = SoapySDR.Device("driver=sdrplay")   # doctor 8/20: lock-guarded above
             break
         except Exception:
             if attempt == 9:
@@ -180,6 +184,7 @@ def cmd_hunt(args):
             ch = []
             t0 = time.time()
             _hb = t0
+            _yield = None
             while time.time() - t0 < args.secs:
                 r = sdr.readStream(st, [buf], len(buf), timeoutUs=800000)
                 if r.ret > 0:
@@ -194,9 +199,18 @@ def cmd_hunt(args):
                 if _lock is not None and time.time() - _hb > 30:
                     try:
                         radio_lock.heartbeat()
+                        # doctor 8/20: poll the want-file too — a higher-
+                        # priority waiter (a sat pass) means wind down, not
+                        # squat behind the heartbeat
+                        _yield = radio_lock.should_yield()
                     except Exception:
                         pass
                     _hb = time.time()
+                    if _yield:
+                        break
+            if _yield:
+                print(f"[hunt] warden: {_yield} — winding down", flush=True)
+                break
             if not ch:
                 # a starved pass (stream interrupted - e.g. an API service
                 # restart mid-hunt, 8/04) is ONE lost pass, not a lost hunt:

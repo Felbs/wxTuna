@@ -50,6 +50,14 @@ from weather_sat import _ensure_sdr_dll_path, OBS_LAT, OBS_LON   # noqa: E402
 
 _ensure_sdr_dll_path()
 
+# one-radio reservation (the weather_sat.py pattern): every SDR path below
+# arbitrates through radio_lock; degrade to bare-open only if it's missing
+sys.path.insert(0, r"Z:\src\gr-radiotuna\tools")
+try:
+    import radio_lock
+except Exception:
+    radio_lock = None
+
 LAB = HERE.parent / "lab"
 SONDE_DIR = LAB / "sonde"
 SONDE_DIR.mkdir(parents=True, exist_ok=True)
@@ -385,6 +393,8 @@ def open_sdr(freq_hz, antenna, gain_db=40, fs=250_000):
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
+    # doctor 8/20: bare-open -> radio_lock — callers hold the lock
+    # (cmd_scan/cmd_capture acquire before calling; grab() heartbeats)
     sdr = SoapySDR.Device("driver=sdrplay")
     sdr.setSampleRate(SOAPY_SDR_RX, 0, fs)
     sdr.setFrequency(SOAPY_SDR_RX, 0, freq_hz)
@@ -411,6 +421,7 @@ def grab(sdr, st, secs, fs=250_000):
     buf = np.empty(2 * 65536, np.int16)
     out = np.empty(2 * n_want, np.int16)
     got = 0
+    hb = 0.0
     while got < n_want:
         r = sdr.readStream(st, [buf], 65536, timeoutUs=1_000_000)
         if r.ret > 0:
@@ -419,6 +430,9 @@ def grab(sdr, st, secs, fs=250_000):
             got += n
         elif r.ret < 0 and r.ret != -1:
             break
+        if radio_lock and time.time() - hb > 1.5:
+            radio_lock.heartbeat()      # lock TTL 90 s < a long --secs grab
+            hb = time.time()
     iq = (out[0::2].astype(np.float32) + 1j * out[1::2].astype(np.float32)) / 32768.0
     return iq[:got].astype(np.complex64)
 
@@ -434,23 +448,36 @@ def close_sdr(sdr, st):
 def cmd_scan(args):
     print(f"[scan] sweeping 400.0-406.0 MHz on {args.antenna} ...")
     hits = []
-    sdr, st = open_sdr(400.1e6, args.antenna, args.gain)
-    import SoapySDR
-    from SoapySDR import SOAPY_SDR_RX
-    for cf in np.arange(400.1e6, 406.0e6, 0.2e6):
-        sdr.setFrequency(SOAPY_SDR_RX, 0, float(cf))
-        time.sleep(0.08)
-        iq = grab(sdr, st, 0.25)
-        spec = np.abs(np.fft.fftshift(np.fft.fft(iq[:65536] * np.hanning(min(65536, len(iq))))))
-        db = 20 * np.log10(spec + 1e-9)
-        med = np.median(db)
-        pk = float(db.max() - med)
-        pk_off = (int(np.argmax(db)) - len(db) // 2) * 250e3 / len(db)
-        if pk > args.thresh:
-            f_mhz = (cf + pk_off) / 1e6
-            hits.append((f_mhz, pk))
-            print(f"  {f_mhz:.3f} MHz  peak +{pk:.0f} dB  <-- candidate")
-    close_sdr(sdr, st)
+    # doctor 8/20: bare-open -> radio_lock (bounded sweep, lab tier)
+    if radio_lock and not radio_lock.acquire(
+            "sonde_scan", "400-406 MHz sonde sweep", 50, wait_s=10):
+        h = radio_lock.status() or {}
+        print(f"[scan] radio held by {h.get('owner','?')} "
+              f"({h.get('purpose','?')}) - skipping")
+        return hits
+    sdr = st = None
+    try:
+        sdr, st = open_sdr(400.1e6, args.antenna, args.gain)
+        import SoapySDR
+        from SoapySDR import SOAPY_SDR_RX
+        for cf in np.arange(400.1e6, 406.0e6, 0.2e6):
+            sdr.setFrequency(SOAPY_SDR_RX, 0, float(cf))
+            time.sleep(0.08)
+            iq = grab(sdr, st, 0.25)
+            spec = np.abs(np.fft.fftshift(np.fft.fft(iq[:65536] * np.hanning(min(65536, len(iq))))))
+            db = 20 * np.log10(spec + 1e-9)
+            med = np.median(db)
+            pk = float(db.max() - med)
+            pk_off = (int(np.argmax(db)) - len(db) // 2) * 250e3 / len(db)
+            if pk > args.thresh:
+                f_mhz = (cf + pk_off) / 1e6
+                hits.append((f_mhz, pk))
+                print(f"  {f_mhz:.3f} MHz  peak +{pk:.0f} dB  <-- candidate")
+    finally:
+        if sdr is not None:
+            close_sdr(sdr, st)
+        if radio_lock:
+            radio_lock.release("sonde_scan")
     if not hits:
         print(f"[scan] nothing above +{args.thresh} dB - no sonde airborne nearby?")
     return hits
@@ -458,9 +485,22 @@ def cmd_scan(args):
 
 def cmd_capture(args):
     print(f"[capture] {args.secs:.0f}s @ {args.mhz:.3f} MHz on {args.antenna}")
-    sdr, st = open_sdr(args.mhz * 1e6, args.antenna, args.gain)
-    iq = grab(sdr, st, args.secs)
-    close_sdr(sdr, st)
+    # doctor 8/20: bare-open -> radio_lock (launch-window hunt = human tier)
+    if radio_lock and not radio_lock.acquire(
+            "sonde_hunt", f"RS41 capture {args.mhz:.3f} MHz", 80, wait_s=10):
+        h = radio_lock.status() or {}
+        print(f"[capture] radio held by {h.get('owner','?')} "
+              f"({h.get('purpose','?')}) - skipping")
+        return 0
+    sdr = st = None
+    try:
+        sdr, st = open_sdr(args.mhz * 1e6, args.antenna, args.gain)
+        iq = grab(sdr, st, args.secs)
+    finally:
+        if sdr is not None:
+            close_sdr(sdr, st)
+        if radio_lock:
+            radio_lock.release("sonde_hunt")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     out = SONDE_DIR / f"rs41_{args.mhz:.3f}_{stamp}.cs16".replace(".", "p", 1)
     (np.round(np.column_stack([iq.real, iq.imag]).ravel() * 32767)

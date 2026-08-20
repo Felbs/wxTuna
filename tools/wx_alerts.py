@@ -35,6 +35,14 @@ from weather_sat import _ensure_sdr_dll_path   # noqa: E402
 
 _ensure_sdr_dll_path()
 
+# one-radio reservation (the weather_sat.py pattern): the monitor arbitrates
+# through radio_lock; degrade to bare-open only if the module is missing
+sys.path.insert(0, r"Z:\src\gr-radiotuna\tools")
+try:
+    import radio_lock
+except Exception:
+    radio_lock = None
+
 LAB = HERE.parent / "lab"
 ALOG = LAB / "wx_alerts.jsonl"
 
@@ -179,23 +187,38 @@ def cmd_monitor(args):
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
-    sdr = SoapySDR.Device("driver=sdrplay")
-    sdr.setSampleRate(SOAPY_SDR_RX, 0, FS_SDR)
-    sdr.setFrequency(SOAPY_SDR_RX, 0, args.khz * 1e3)
+    # doctor 8/20: bare-open -> radio_lock (leave-running monitor = lab tier;
+    # yields to a sat pass or a human, never opens over a holder)
+    if radio_lock and not radio_lock.acquire(
+            "wx_alerts", f"SAME monitor {args.khz:.0f} kHz", 50, wait_s=10):
+        h = radio_lock.status() or {}
+        print(f"[monitor] radio held by {h.get('owner','?')} "
+              f"({h.get('purpose','?')}) - not opening")
+        return
+    sdr = st = None
     try:
-        sdr.setAntenna(SOAPY_SDR_RX, 0, args.antenna)
-        sdr.setGainMode(SOAPY_SDR_RX, 0, False)
-        sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", 25)
-        sdr.writeSetting("rfgain_sel", "0")
-    except Exception:
-        pass
-    st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
-    sdr.activateStream(st)
-    print(f"[monitor] {args.khz} kHz - watching for SAME bursts (Ctrl+C stops)")
-    buf = np.empty(2 * 65536, np.int16)
-    g = gcd(int(AUD * 6), int(FS))
-    try:
+        sdr = SoapySDR.Device("driver=sdrplay")
+        sdr.setSampleRate(SOAPY_SDR_RX, 0, FS_SDR)
+        sdr.setFrequency(SOAPY_SDR_RX, 0, args.khz * 1e3)
+        try:
+            sdr.setAntenna(SOAPY_SDR_RX, 0, args.antenna)
+            sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+            sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", 25)
+            sdr.writeSetting("rfgain_sel", "0")
+        except Exception:
+            pass
+        st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
+        sdr.activateStream(st)
+        print(f"[monitor] {args.khz} kHz - watching for SAME bursts (Ctrl+C stops)")
+        buf = np.empty(2 * 65536, np.int16)
+        g = gcd(int(AUD * 6), int(FS))
+        hb = 0.0
         while True:
+            # a higher-priority waiter (sat pass, human) -> wind down cleanly
+            why = radio_lock.should_yield() if radio_lock else None
+            if why:
+                print(f"[monitor] yielding the radio: {why}")
+                break
             n_want = int(8 * FS_SDR)
             out = np.empty(2 * n_want, np.int16)
             got = 0
@@ -205,6 +228,9 @@ def cmd_monitor(args):
                     n = min(r.ret, n_want - got)
                     out[2 * got:2 * (got + n)] = buf[:2 * n]
                     got += n
+                if radio_lock and time.time() - hb > 1.5:
+                    radio_lock.heartbeat()   # lock TTL 90 s, monitor runs for days
+                    hb = time.time()
             iq = ((out[0::2].astype(np.float32)
                    + 1j * out[1::2].astype(np.float32)) / 32768.0)
             # decimate 2.048M -> 250k (exact 125/1024) per 8 s block; the
@@ -222,8 +248,15 @@ def cmd_monitor(args):
                     f.write(json.dumps(line) + "\n")
     except KeyboardInterrupt:
         pass
-    sdr.deactivateStream(st)
-    sdr.closeStream(st)
+    finally:
+        try:
+            if st is not None:
+                sdr.deactivateStream(st)
+                sdr.closeStream(st)
+        except Exception:
+            pass
+        if radio_lock:
+            radio_lock.release("wx_alerts")
 
 
 def main():

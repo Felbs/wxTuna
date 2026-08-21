@@ -4,6 +4,8 @@
 
 **Adaptive weather-satellite decoding — the TV Tuna method, aimed at the sky.**
 
+**Project site:** [felbs.software](https://felbs.software) · **Contact:** [E@felbs.software](mailto:E@felbs.software)
+
 Born 2026-07-17 from [Radio Tuna](https://github.com/Felbs/gr-radiotuna) and
 [Software-TV-Tuner](https://github.com/Felbs/Software-TV-Tuner) (TV Tuna),
 where the method was forged against ATSC television on marginal antennas.

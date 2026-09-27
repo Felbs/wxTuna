@@ -58,6 +58,8 @@ python tools/lrpt.py decode lab/wxsat/lrpt_*.cs16
 `lrpt.py decode` needs at least one recorded capture first.)
 Set your location with `WXSAT_LAT` / `WXSAT_LON` env vars (or `--lat/--lon`);
 the default is metro-coarse. Runs under **radioconda** (needs `SoapySDR`,
+  On Arch/Omarchy: `pacman -S python-numpy python-scipy soapysdr` plus `pip install sgp4` in a venv made with
+  `python -m venv --system-site-packages .venv` (no distro package for sgp4; the pass predictor needs it).
 `numpy`, `scipy`, `sgp4`, `numba`, `matplotlib`, `Pillow`).
 
 ## Status (early)
